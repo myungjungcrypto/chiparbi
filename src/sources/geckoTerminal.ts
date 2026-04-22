@@ -1,13 +1,12 @@
 import { useStore } from '@/state/store';
 import { GECKOTERMINAL_NETWORK, resolveDexAddresses } from '@/lib/symbols';
-import type { Chain } from '@/lib/types';
+import type { Chain, PoolQuote } from '@/lib/types';
 
 interface GtTokenAttributes {
   price_usd?: string | null;
   fdv_usd?: string | null;
   total_reserve_in_usd?: string | null;
   volume_usd?: { h24?: string | null };
-  top_pools?: unknown;
 }
 
 interface GtTokenResponse {
@@ -19,26 +18,37 @@ interface GtTokenResponse {
   };
 }
 
-interface GtPoolAttributes {
-  address?: string;
-  name?: string;
-  dex_id?: string;
-  base_token_price_usd?: string;
-  reserve_in_usd?: string;
-  volume_usd?: { h24?: string };
-}
-
-interface GtPoolResponse {
-  data?: {
-    attributes?: GtPoolAttributes;
-    relationships?: { dex?: { data?: { id?: string } } };
-  };
-}
-
 function num(v: string | null | undefined): number | null {
   if (!v) return null;
   const n = parseFloat(v);
   return Number.isFinite(n) ? n : null;
+}
+
+const STALE_AFTER_MS = 30_000;
+
+function applyError(chain: Chain, message: string): void {
+  const existing = useStore.getState().pools[chain];
+  const now = Date.now();
+  if (existing && existing.state === 'live' && now - existing.updatedAt < STALE_AFTER_MS) {
+    console.warn(`[geckoTerminal] ${chain} error (keeping last live): ${message}`);
+    return;
+  }
+  if (existing && existing.state === 'no-pool' && now - existing.updatedAt < STALE_AFTER_MS) {
+    console.warn(`[geckoTerminal] ${chain} error (keeping last no-pool): ${message}`);
+    return;
+  }
+  useStore.getState().setPool(chain, {
+    chain,
+    poolAddress: existing?.poolAddress ?? null,
+    dexName: existing?.dexName ?? null,
+    priceUsd: null,
+    liquidityUsd: null,
+    volume24hUsd: null,
+    fdvUsd: null,
+    updatedAt: now,
+    state: 'error',
+    errorMessage: message,
+  });
 }
 
 async function fetchOne(chain: Chain): Promise<void> {
@@ -48,6 +58,8 @@ async function fetchOne(chain: Chain): Promise<void> {
   try {
     const r = await fetch(url);
     if (r.status === 404) {
+      const existing = useStore.getState().pools[chain];
+      if (existing?.state === 'live') return;
       useStore.getState().setPool(chain, {
         chain,
         poolAddress: null,
@@ -62,18 +74,7 @@ async function fetchOne(chain: Chain): Promise<void> {
       return;
     }
     if (!r.ok) {
-      useStore.getState().setPool(chain, {
-        chain,
-        poolAddress: null,
-        dexName: null,
-        priceUsd: null,
-        liquidityUsd: null,
-        volume24hUsd: null,
-        fdvUsd: null,
-        updatedAt: Date.now(),
-        state: 'error',
-        errorMessage: `HTTP ${r.status}`,
-      });
+      applyError(chain, `HTTP ${r.status}`);
       return;
     }
     const j = (await r.json()) as GtTokenResponse;
@@ -84,53 +85,32 @@ async function fetchOne(chain: Chain): Promise<void> {
     const volume24hUsd = num(attrs.volume_usd?.h24 ?? null);
 
     const poolIds = j?.data?.relationships?.top_pools?.data ?? [];
-    let poolAddress: string | null = null;
-    let dexName: string | null = null;
+    const existing = useStore.getState().pools[chain];
+    let poolAddress: string | null = existing?.poolAddress ?? null;
     if (poolIds.length > 0) {
       const firstId = poolIds[0]?.id ?? '';
       const parts = firstId.split('_');
-      poolAddress = parts.slice(1).join('_') || null;
-      try {
-        const pr = await fetch(
-          `https://api.geckoterminal.com/api/v2/networks/${net}/pools/${poolAddress}`,
-        );
-        if (pr.ok) {
-          const pj = (await pr.json()) as GtPoolResponse;
-          dexName = pj?.data?.relationships?.dex?.data?.id ?? pj?.data?.attributes?.dex_id ?? null;
-        }
-      } catch {
-        // ignore
-      }
+      poolAddress = parts.slice(1).join('_') || poolAddress;
     }
 
-    useStore.getState().setPool(chain, {
+    const next: PoolQuote = {
       chain,
       poolAddress,
-      dexName,
+      dexName: existing?.dexName ?? null,
       priceUsd,
       liquidityUsd,
       volume24hUsd,
       fdvUsd,
       updatedAt: Date.now(),
       state: priceUsd != null ? 'live' : 'no-pool',
-    });
+    };
+    useStore.getState().setPool(chain, next);
   } catch (err) {
-    useStore.getState().setPool(chain, {
-      chain,
-      poolAddress: null,
-      dexName: null,
-      priceUsd: null,
-      liquidityUsd: null,
-      volume24hUsd: null,
-      fdvUsd: null,
-      updatedAt: Date.now(),
-      state: 'error',
-      errorMessage: err instanceof Error ? err.message : 'unknown',
-    });
+    applyError(chain, err instanceof Error ? err.message : 'unknown');
   }
 }
 
-export function startGeckoTerminal(intervalMs = 5000): () => void {
+export function startGeckoTerminal(intervalMs = 15_000): () => void {
   const chains: Chain[] = ['base', 'eth', 'arbitrum'];
   const tick = () => {
     chains.forEach((c) => void fetchOne(c));
