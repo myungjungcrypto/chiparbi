@@ -1,6 +1,6 @@
 import { createPublicClient, http, type PublicClient, type Address } from 'viem';
 import { LZ_CHAINS, type SendParam } from './oft';
-import { OFT_ABI } from './abi';
+import { OFT_ABI, ERC20_ABI } from './abi';
 
 const clients = new Map<string, PublicClient>();
 
@@ -75,6 +75,89 @@ export async function discoverPeers(
 export interface QuoteResult {
   nativeFee: bigint;
   lzTokenFee: bigint;
+}
+
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+export interface AdapterInfo {
+  adapter: string;
+  chainKey: string;
+  endpoint: string | null;
+  token: string | null;
+  approvalRequired: boolean | null;
+  decimals: number | null;
+  symbol: string | null;
+  supportedEids: Set<number>;
+  isOft: boolean;
+  notes: string[];
+}
+
+export async function detectAdapter(
+  chainKey: string,
+  adapter: string,
+  signal?: AbortSignal,
+): Promise<AdapterInfo> {
+  const client = getClient(chainKey);
+  const notes: string[] = [];
+
+  const [endpointRes, tokenRes, approvalRes] = await Promise.allSettled([
+    client.readContract({ address: adapter as Address, abi: OFT_ABI, functionName: 'endpoint' }),
+    client.readContract({ address: adapter as Address, abi: OFT_ABI, functionName: 'token' }),
+    client.readContract({
+      address: adapter as Address,
+      abi: OFT_ABI,
+      functionName: 'approvalRequired',
+    }),
+  ]);
+
+  if (signal?.aborted) throw new Error('aborted');
+
+  const endpoint = endpointRes.status === 'fulfilled' ? (endpointRes.value as string) : null;
+  const rawToken = tokenRes.status === 'fulfilled' ? (tokenRes.value as string) : null;
+  const approvalRequired =
+    approvalRes.status === 'fulfilled' ? (approvalRes.value as boolean) : null;
+
+  if (!endpoint) notes.push('endpoint() reverted — not a LayerZero OFT?');
+  const isOft = !!endpoint;
+
+  const hasSeparateToken =
+    !!rawToken && rawToken.toLowerCase() !== ZERO_ADDRESS && rawToken.toLowerCase() !== adapter.toLowerCase();
+  const token = hasSeparateToken ? rawToken : null;
+  const decimalsTarget = (token ?? adapter) as Address;
+
+  const [decimalsRes, symbolRes] = await Promise.allSettled([
+    client.readContract({ address: decimalsTarget, abi: ERC20_ABI, functionName: 'decimals' }),
+    client.readContract({ address: decimalsTarget, abi: ERC20_ABI, functionName: 'symbol' }),
+  ]);
+  if (signal?.aborted) throw new Error('aborted');
+
+  const decimals = decimalsRes.status === 'fulfilled' ? Number(decimalsRes.value) : null;
+  const symbol = symbolRes.status === 'fulfilled' ? (symbolRes.value as string) : null;
+
+  if (decimals == null) notes.push('decimals() failed');
+  if (approvalRequired === null) notes.push('approvalRequired() not implemented (defaulting)');
+
+  let supportedEids = new Set<number>();
+  try {
+    const peers = await discoverPeers(chainKey, adapter, signal);
+    supportedEids = peers.supported;
+    if (peers.errored) notes.push(`peers scan: ${peers.errorMessage ?? 'rpc error'}`);
+  } catch (e) {
+    if (!signal?.aborted) notes.push(`peers scan threw: ${(e as Error).message}`);
+  }
+
+  return {
+    adapter,
+    chainKey,
+    endpoint,
+    token,
+    approvalRequired,
+    decimals,
+    symbol,
+    supportedEids,
+    isOft,
+    notes,
+  };
 }
 
 export async function fetchQuoteSend(

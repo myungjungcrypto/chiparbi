@@ -17,12 +17,15 @@ import {
   type OftPreset,
 } from '@/lib/presets';
 import {
+  detectAdapter,
   discoverPeers,
   fetchQuoteSend,
   rpcUrl,
+  type AdapterInfo,
   type PeerDiscoveryResult,
   type QuoteResult,
 } from '@/lib/rpc';
+import { buildGraph, directPeer, shortestPath, type PeerMap } from '@/lib/topology';
 
 export function OftBridgeHelper() {
   const [presets, setPresets] = useState<OftPreset[]>(() => getPresets());
@@ -49,6 +52,10 @@ export function OftBridgeHelper() {
   const [peersResult, setPeersResult] = useState<PeerDiscoveryResult | null>(null);
   const [peersLoading, setPeersLoading] = useState(false);
   const peersRefreshRef = useRef(0);
+
+  const [peerMap, setPeerMap] = useState<PeerMap>({});
+  const [detectionMap, setDetectionMap] = useState<Record<string, AdapterInfo | null>>({});
+  const [detectingChains, setDetectingChains] = useState<Set<string>>(new Set());
 
   const [quoteResult, setQuoteResult] = useState<QuoteResult | null>(null);
   const [quoteLoading, setQuoteLoading] = useState(false);
@@ -126,6 +133,7 @@ export function OftBridgeHelper() {
       .then((res) => {
         if (myTicket !== peersRefreshRef.current) return;
         setPeersResult(res);
+        setPeerMap((m) => ({ ...m, [srcKey]: res.supported }));
       })
       .catch((e) => {
         if (myTicket !== peersRefreshRef.current) return;
@@ -173,6 +181,61 @@ export function OftBridgeHelper() {
 
   const useQuoteAsFee = () => {
     if (quoteResult) setNativeFee(quoteResult.nativeFee.toString());
+  };
+
+  const detectOne = async (chainKey: string) => {
+    const addr = preset.adapters[chainKey];
+    if (!addr || !isValidAddress(addr)) return;
+    setDetectingChains((s) => new Set(s).add(chainKey));
+    try {
+      const info = await detectAdapter(chainKey, addr);
+      setDetectionMap((m) => ({ ...m, [chainKey]: info }));
+      setPeerMap((m) => ({ ...m, [chainKey]: info.supportedEids }));
+      const patch: Partial<OftPreset> = {};
+      const nextLockbox = { ...preset.adapterIsLockbox };
+      const nextTokens = { ...preset.tokenAddresses };
+      const nextSymbol = !preset.symbol && info.symbol ? info.symbol : preset.symbol;
+      const nextDecimals = info.decimals ?? preset.decimals;
+      if (info.approvalRequired != null) nextLockbox[chainKey] = info.approvalRequired;
+      if (info.token) nextTokens[chainKey] = info.token;
+      if (info.token || info.approvalRequired != null) {
+        patch.adapterIsLockbox = nextLockbox;
+        patch.tokenAddresses = nextTokens;
+      }
+      if (nextDecimals !== preset.decimals) patch.decimals = nextDecimals;
+      if (nextSymbol !== preset.symbol) patch.symbol = nextSymbol;
+      if (Object.keys(patch).length > 0) {
+        const merged: OftPreset = { ...preset, ...patch };
+        savePreset(merged);
+      }
+    } catch (e) {
+      setDetectionMap((m) => ({
+        ...m,
+        [chainKey]: {
+          adapter: addr,
+          chainKey,
+          endpoint: null,
+          token: null,
+          approvalRequired: null,
+          decimals: null,
+          symbol: null,
+          supportedEids: new Set(),
+          isOft: false,
+          notes: [e instanceof Error ? e.message : String(e)],
+        },
+      }));
+    } finally {
+      setDetectingChains((s) => {
+        const next = new Set(s);
+        next.delete(chainKey);
+        return next;
+      });
+    }
+  };
+
+  const detectAll = async () => {
+    const filled = LZ_CHAINS.filter((c) => isValidAddress(preset.adapters[c.key] ?? ''));
+    await Promise.all(filled.map((c) => detectOne(c.key)));
   };
 
   const refreshPeers = () => {
@@ -270,8 +333,18 @@ export function OftBridgeHelper() {
         <PresetEditor
           preset={preset}
           onChange={savePreset}
+          onDetectOne={detectOne}
+          onDetectAll={detectAll}
+          detectionMap={detectionMap}
+          detectingChains={detectingChains}
         />
       )}
+
+      <TopologyBox
+        peerMap={peerMap}
+        detectionMap={detectionMap}
+        preset={preset}
+      />
 
       <div className="p-3 grid grid-cols-1 md:grid-cols-2 gap-3 border-b border-ink-700">
         <Field label="Source chain">
@@ -343,6 +416,12 @@ export function OftBridgeHelper() {
               ↻
             </button>
           </div>
+          <RouteSuggestion
+            peerMap={peerMap}
+            srcKey={srcKey}
+            dstKey={dstKey}
+            dstEid={dstChain?.eid ?? null}
+          />
         </Field>
         <Field label="Recipient (EVM address)">
           <input
@@ -516,9 +595,17 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 function PresetEditor({
   preset,
   onChange,
+  onDetectOne,
+  onDetectAll,
+  detectionMap,
+  detectingChains,
 }: {
   preset: OftPreset;
   onChange: (p: OftPreset) => void;
+  onDetectOne: (chainKey: string) => void;
+  onDetectAll: () => void;
+  detectionMap: Record<string, AdapterInfo | null>;
+  detectingChains: Set<string>;
 }) {
   const update = (patch: Partial<OftPreset>) => onChange({ ...preset, ...patch });
 
@@ -575,8 +662,15 @@ function PresetEditor({
       </Field>
 
       <div>
-        <div className="text-[11px] text-ink-300 font-mono mb-1">
-          Per-chain adapters (leave blank if not deployed)
+        <div className="text-[11px] text-ink-300 font-mono mb-1 flex items-center gap-2">
+          <span>Per-chain adapters (paste address, then click Detect to auto-fill rest)</span>
+          <button
+            type="button"
+            onClick={onDetectAll}
+            className="ml-auto px-2 py-0.5 rounded bg-accent-blue/20 hover:bg-accent-blue/30 border border-accent-blue/40 text-accent-blue text-xs"
+          >
+            Detect all
+          </button>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-xs font-mono">
@@ -585,47 +679,78 @@ function PresetEditor({
                 <th className="text-left p-1">Chain</th>
                 <th className="text-left p-1">Adapter / OFT address</th>
                 <th className="text-left p-1">Lockbox?</th>
-                <th className="text-left p-1">Token address (for approve)</th>
+                <th className="text-left p-1">Token address</th>
+                <th className="text-left p-1">Detect</th>
               </tr>
             </thead>
             <tbody>
-              {LZ_CHAINS.map((c) => (
-                <tr key={c.key} className="border-t border-ink-700">
-                  <td className="p-1 text-ink-100">
-                    {c.label}
-                    <div className="text-[10px] text-ink-400">eid {c.eid}</div>
-                  </td>
-                  <td className="p-1">
-                    <input
-                      value={preset.adapters[c.key] ?? ''}
-                      onChange={(e) => autoFill(c.key, e.target.value)}
-                      placeholder="0x..."
-                      className="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 font-mono"
-                    />
-                  </td>
-                  <td className="p-1">
-                    <input
-                      type="checkbox"
-                      checked={!!preset.adapterIsLockbox[c.key]}
-                      onChange={(e) => updateLockbox(c.key, e.target.checked)}
-                    />
-                  </td>
-                  <td className="p-1">
-                    <input
-                      value={preset.tokenAddresses[c.key] ?? ''}
-                      onChange={(e) => updateToken(c.key, e.target.value)}
-                      placeholder="0x... (only needed if lockbox)"
-                      className="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 font-mono"
-                    />
-                  </td>
-                </tr>
-              ))}
+              {LZ_CHAINS.map((c) => {
+                const info = detectionMap[c.key];
+                const loading = detectingChains.has(c.key);
+                const addr = preset.adapters[c.key] ?? '';
+                const validAddr = isValidAddress(addr);
+                return (
+                  <tr key={c.key} className="border-t border-ink-700 align-top">
+                    <td className="p-1 text-ink-100">
+                      {c.label}
+                      <div className="text-[10px] text-ink-400">eid {c.eid}</div>
+                    </td>
+                    <td className="p-1">
+                      <input
+                        value={addr}
+                        onChange={(e) => autoFill(c.key, e.target.value)}
+                        placeholder="0x..."
+                        className="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 font-mono"
+                      />
+                      {info && (
+                        <div className="text-[10px] mt-0.5">
+                          {info.isOft ? (
+                            <span className="text-accent-green">
+                              ✓ OFT{info.symbol ? ` · ${info.symbol}` : ''} · {info.supportedEids.size} peer(s)
+                            </span>
+                          ) : (
+                            <span className="text-accent-red">✗ not an OFT</span>
+                          )}
+                          {info.notes.length > 0 && (
+                            <div className="text-accent-yellow">{info.notes.join('; ')}</div>
+                          )}
+                        </div>
+                      )}
+                    </td>
+                    <td className="p-1">
+                      <input
+                        type="checkbox"
+                        checked={!!preset.adapterIsLockbox[c.key]}
+                        onChange={(e) => updateLockbox(c.key, e.target.checked)}
+                      />
+                    </td>
+                    <td className="p-1">
+                      <input
+                        value={preset.tokenAddresses[c.key] ?? ''}
+                        onChange={(e) => updateToken(c.key, e.target.value)}
+                        placeholder="auto-filled after Detect"
+                        className="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 font-mono"
+                      />
+                    </td>
+                    <td className="p-1">
+                      <button
+                        type="button"
+                        onClick={() => onDetectOne(c.key)}
+                        disabled={!validAddr || loading}
+                        className="px-2 py-1 rounded bg-ink-700 hover:bg-ink-600 border border-ink-600 disabled:opacity-40"
+                      >
+                        {loading ? '…' : 'Detect'}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
         <div className="text-[10px] text-ink-400 font-mono mt-2">
-          Lockbox = OFTAdapter wrapping an existing ERC20 (approve required before send).
-          Native OFT = token itself is the OFT contract (no approve).
+          Detect calls endpoint() / token() / approvalRequired() / decimals() and scans all 11 peers()
+          on that chain's RPC. Lockbox auto-unchecks for native OFTs, auto-checks for adapters.
         </div>
       </div>
 
@@ -713,6 +838,122 @@ function LiveQuoteCard({
         Live RPC quote (auto-updates, 500ms debounce)
       </div>
       {body}
+    </div>
+  );
+}
+
+function TopologyBox({
+  peerMap,
+  detectionMap,
+  preset,
+}: {
+  peerMap: PeerMap;
+  detectionMap: Record<string, AdapterInfo | null>;
+  preset: OftPreset;
+}) {
+  const detectedChains = LZ_CHAINS.filter(
+    (c) => peerMap[c.key] !== undefined || detectionMap[c.key] !== undefined,
+  );
+  const filledChains = LZ_CHAINS.filter((c) => (preset.adapters[c.key] ?? '').length > 0);
+
+  if (detectedChains.length === 0 && filledChains.length === 0) return null;
+
+  return (
+    <div className="p-3 border-b border-ink-700 bg-ink-900/40">
+      <div className="text-xs font-semibold text-ink-100 mb-2">
+        Detected topology
+        <span className="ml-2 text-[10px] text-ink-400 font-normal font-mono">
+          per-chain peers discovered via RPC
+        </span>
+      </div>
+      {detectedChains.length === 0 ? (
+        <div className="text-[11px] text-ink-400 font-mono">
+          No detections yet. Click <span className="text-ink-200">Detect all</span> in the editor
+          above (or per-row Detect) to scan each filled adapter.
+        </div>
+      ) : (
+        <div className="space-y-1 font-mono text-xs">
+          {detectedChains.map((c) => {
+            const eids = peerMap[c.key];
+            const dests = eids
+              ? LZ_CHAINS.filter((x) => eids.has(x.eid)).map((x) => x.label)
+              : [];
+            const info = detectionMap[c.key];
+            return (
+              <div key={c.key} className="flex items-start gap-2">
+                <span className="w-32 shrink-0 text-ink-100">{c.label}</span>
+                <span className="text-ink-400">→</span>
+                {dests.length > 0 ? (
+                  <span className="text-accent-green">{dests.join(', ')}</span>
+                ) : (
+                  <span className="text-accent-yellow">no peers found</span>
+                )}
+                {info?.symbol && (
+                  <span className="ml-auto text-ink-500 text-[10px]">
+                    {info.symbol}
+                    {info.decimals != null ? ` · ${info.decimals}d` : ''}
+                    {info.approvalRequired === true
+                      ? ' · lockbox'
+                      : info.approvalRequired === false
+                        ? ' · native OFT'
+                        : ''}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RouteSuggestion({
+  peerMap,
+  srcKey,
+  dstKey,
+  dstEid,
+}: {
+  peerMap: PeerMap;
+  srcKey: string;
+  dstKey: string;
+  dstEid: number | null;
+}) {
+  if (!dstEid || srcKey === dstKey) return null;
+  const srcPeers = peerMap[srcKey];
+  if (!srcPeers) return null;
+  const isDirect = directPeer(peerMap, srcKey, dstEid);
+  if (isDirect) return null;
+
+  const graph = buildGraph(peerMap);
+  const path = shortestPath(graph, srcKey, dstKey);
+
+  if (!path || path.length <= 1) {
+    return (
+      <div className="text-[11px] text-accent-red font-mono mt-1 p-2 border border-accent-red/30 bg-accent-red/5 rounded">
+        ⚠ Direct peer not configured and no indirect route found in detected topology.
+        send() will revert. Detect more chains or use a CEX as bridge.
+      </div>
+    );
+  }
+
+  const labels = path
+    .map((k) => LZ_CHAINS.find((c) => c.key === k)?.label ?? k)
+    .join(' → ');
+  const hops = path.length - 1;
+
+  return (
+    <div className="text-[11px] font-mono mt-1 p-2 border border-accent-yellow/40 bg-accent-yellow/5 rounded">
+      <div className="text-accent-yellow">
+        ⚠ Direct send from {labels.split(' → ')[0]} to{' '}
+        {labels.split(' → ').slice(-1)[0]} not configured. send() would revert.
+      </div>
+      <div className="text-ink-200 mt-1">
+        Suggested route ({hops} hop{hops > 1 ? 's' : ''}): <span className="text-accent-green">{labels}</span>
+      </div>
+      <div className="text-ink-400 mt-0.5">
+        Each hop = separate send() + approve() + LZ fee. No atomicity between hops.
+      </div>
     </div>
   );
 }
