@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { CopyField } from './CopyField';
 import {
   LZ_CHAINS,
@@ -16,6 +16,13 @@ import {
   upsertPreset,
   type OftPreset,
 } from '@/lib/presets';
+import {
+  discoverPeers,
+  fetchQuoteSend,
+  rpcUrl,
+  type PeerDiscoveryResult,
+  type QuoteResult,
+} from '@/lib/rpc';
 
 export function OftBridgeHelper() {
   const [presets, setPresets] = useState<OftPreset[]>(() => getPresets());
@@ -39,6 +46,15 @@ export function OftBridgeHelper() {
   const [nativeFee, setNativeFee] = useState<string>('');
   const [editing, setEditing] = useState<boolean>(false);
 
+  const [peersResult, setPeersResult] = useState<PeerDiscoveryResult | null>(null);
+  const [peersLoading, setPeersLoading] = useState(false);
+  const peersRefreshRef = useRef(0);
+
+  const [quoteResult, setQuoteResult] = useState<QuoteResult | null>(null);
+  const [quoteLoading, setQuoteLoading] = useState(false);
+  const [quoteError, setQuoteError] = useState<string | null>(null);
+  const [quoteAt, setQuoteAt] = useState<number>(0);
+
   useEffect(() => {
     setGasLimit(preset.defaultGasLimit ?? 80_000);
     const first = LZ_CHAINS.find((c) => (preset.adapters[c.key] ?? '').length > 0);
@@ -53,32 +69,30 @@ export function OftBridgeHelper() {
   const needsApprove = preset.adapterIsLockbox[srcKey] === true;
 
   const recipientValid = isValidAddress(recipient);
-  let sendParamError: string | null = null;
-  let sendParamTuple = '';
-  let toBytes32 = '';
-  let amountLDStr = '';
-  let minAmountLDStr = '';
-  let extraOptionsStr = '';
+  const built = useMemo(() => {
+    try {
+      if (!dstChain) return { error: 'destination chain not selected' as const };
+      if (!recipientValid) return { error: 'recipient not a valid 0x address' as const };
+      const p = buildSendParam({
+        dstEid: dstChain.eid,
+        recipient,
+        amount,
+        decimals: preset.decimals,
+        slippageBps,
+        gasLimit,
+      });
+      return { param: p };
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : 'error' };
+    }
+  }, [dstChain, recipientValid, recipient, amount, preset.decimals, slippageBps, gasLimit]);
 
-  try {
-    if (!dstChain) throw new Error('destination chain not selected');
-    if (!recipientValid) throw new Error('recipient not a valid 0x address');
-    const p = buildSendParam({
-      dstEid: dstChain.eid,
-      recipient,
-      amount,
-      decimals: preset.decimals,
-      slippageBps,
-      gasLimit,
-    });
-    sendParamTuple = sendParamAsTupleString(p);
-    toBytes32 = p.to;
-    amountLDStr = p.amountLD;
-    minAmountLDStr = p.minAmountLD;
-    extraOptionsStr = p.extraOptions;
-  } catch (e) {
-    sendParamError = e instanceof Error ? e.message : 'error';
-  }
+  const sendParamError = built.error ?? null;
+  const sendParamTuple = built.param ? sendParamAsTupleString(built.param) : '';
+  const toBytes32 = built.param?.to ?? '';
+  const amountLDStr = built.param?.amountLD ?? '';
+  const minAmountLDStr = built.param?.minAmountLD ?? '';
+  const extraOptionsStr = built.param?.extraOptions ?? '';
 
   const approveAmountLD = (() => {
     try {
@@ -99,6 +113,90 @@ export function OftBridgeHelper() {
   const readUrl = srcAdapter ? `${srcExplorerBase}/address/${srcAdapter}#readContract` : '';
   const tokenApproveUrl = srcToken ? `${srcExplorerBase}/address/${srcToken}#writeContract` : '';
   const lzScanBase = 'https://layerzeroscan.com';
+  const srcRpc = rpcUrl(srcKey);
+
+  const adapterKey = `${srcKey}:${srcAdapter.toLowerCase()}`;
+  useEffect(() => {
+    setPeersResult(null);
+    if (!isValidAddress(srcAdapter)) return;
+    const ctrl = new AbortController();
+    setPeersLoading(true);
+    const myTicket = ++peersRefreshRef.current;
+    discoverPeers(srcKey, srcAdapter, ctrl.signal)
+      .then((res) => {
+        if (myTicket !== peersRefreshRef.current) return;
+        setPeersResult(res);
+      })
+      .catch((e) => {
+        if (myTicket !== peersRefreshRef.current) return;
+        setPeersResult({
+          supported: new Set(),
+          errored: true,
+          errorMessage: e instanceof Error ? e.message : String(e),
+        });
+      })
+      .finally(() => {
+        if (myTicket === peersRefreshRef.current) setPeersLoading(false);
+      });
+    return () => {
+      ctrl.abort();
+    };
+  }, [adapterKey, srcKey, srcAdapter]);
+
+  const quoteKey = `${adapterKey}|${dstChain?.eid ?? ''}|${amountLDStr}|${minAmountLDStr}|${extraOptionsStr}|${toBytes32}`;
+  useEffect(() => {
+    setQuoteResult(null);
+    setQuoteError(null);
+    if (!built.param || !isValidAddress(srcAdapter)) return;
+    const ctrl = new AbortController();
+    setQuoteLoading(true);
+    const timer = window.setTimeout(() => {
+      fetchQuoteSend(srcKey, srcAdapter, built.param!, ctrl.signal)
+        .then((q) => {
+          if (ctrl.signal.aborted) return;
+          setQuoteResult(q);
+          setQuoteAt(Date.now());
+        })
+        .catch((e) => {
+          if (ctrl.signal.aborted) return;
+          setQuoteError(e instanceof Error ? e.message : String(e));
+        })
+        .finally(() => {
+          if (!ctrl.signal.aborted) setQuoteLoading(false);
+        });
+    }, 500);
+    return () => {
+      ctrl.abort();
+      window.clearTimeout(timer);
+    };
+  }, [quoteKey, srcKey, srcAdapter, built.param]);
+
+  const useQuoteAsFee = () => {
+    if (quoteResult) setNativeFee(quoteResult.nativeFee.toString());
+  };
+
+  const refreshPeers = () => {
+    if (!isValidAddress(srcAdapter)) return;
+    setPeersResult(null);
+    setPeersLoading(true);
+    const myTicket = ++peersRefreshRef.current;
+    discoverPeers(srcKey, srcAdapter)
+      .then((res) => {
+        if (myTicket !== peersRefreshRef.current) return;
+        setPeersResult(res);
+      })
+      .catch((e) => {
+        if (myTicket !== peersRefreshRef.current) return;
+        setPeersResult({
+          supported: new Set(),
+          errored: true,
+          errorMessage: e instanceof Error ? e.message : String(e),
+        });
+      })
+      .finally(() => {
+        if (myTicket === peersRefreshRef.current) setPeersLoading(false);
+      });
+  };
 
   const savePreset = (updated: OftPreset) => {
     const list = upsertPreset(updated);
@@ -199,12 +297,52 @@ export function OftBridgeHelper() {
             onChange={(e) => setDstKey(e.target.value)}
             className="w-full bg-ink-900 border border-ink-700 rounded px-2 py-1 text-xs font-mono"
           >
-            {dstChains.map((c) => (
-              <option key={c.key} value={c.key} disabled={c.key === srcKey}>
-                {c.label} (eid {c.eid})
-              </option>
-            ))}
+            {dstChains.map((c) => {
+              const isPeer = peersResult?.supported.has(c.eid);
+              const badge = peersResult
+                ? isPeer
+                  ? ' ✓ peer'
+                  : ' ✗ not a peer'
+                : '';
+              return (
+                <option key={c.key} value={c.key} disabled={c.key === srcKey}>
+                  {c.label} (eid {c.eid}){badge}
+                </option>
+              );
+            })}
           </select>
+          <div className="text-[10px] text-ink-400 font-mono mt-1 flex items-center gap-2">
+            {peersLoading && <span>discovering peers…</span>}
+            {!peersLoading && peersResult && !peersResult.errored && (
+              <span>
+                {peersResult.supported.size > 0 ? (
+                  <>
+                    supported:{' '}
+                    {LZ_CHAINS.filter((c) => peersResult.supported.has(c.eid))
+                      .map((c) => c.label)
+                      .join(', ')}
+                  </>
+                ) : (
+                  <span className="text-accent-yellow">
+                    no peers found — not an OFT? try refresh or check RPC
+                  </span>
+                )}
+              </span>
+            )}
+            {!peersLoading && peersResult?.errored && (
+              <span className="text-accent-red">
+                RPC error: {peersResult.errorMessage?.slice(0, 80) ?? 'unknown'}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={refreshPeers}
+              disabled={!isValidAddress(srcAdapter)}
+              className="ml-auto px-2 py-0.5 rounded bg-ink-700 hover:bg-ink-600 border border-ink-600 disabled:opacity-50"
+            >
+              ↻
+            </button>
+          </div>
         </Field>
         <Field label="Recipient (EVM address)">
           <input
@@ -294,10 +432,22 @@ export function OftBridgeHelper() {
               Open adapter Read on {srcChain?.label} ↗
             </a>
           )}
+          <span className="text-[10px] text-ink-500 font-mono ml-auto">
+            RPC: {srcRpc ?? '—'}
+          </span>
         </div>
-        <div className="text-[11px] text-ink-300 font-mono">
-          Paste the SendParam tuple into <code>quoteSend</code>. Record the returned{' '}
-          <code>nativeFee</code> — you'll need it in Step 2.
+
+        <LiveQuoteCard
+          loading={quoteLoading}
+          error={quoteError}
+          result={quoteResult}
+          quoteAt={quoteAt}
+          onUse={useQuoteAsFee}
+          hasParams={!!built.param}
+        />
+
+        <div className="text-[11px] text-ink-400 font-mono pt-1">
+          Or run it manually: paste the tuple below into <code>quoteSend</code> on Etherscan.
         </div>
         <CopyField label="_sendParam" value={sendParamTuple} multiline />
         <CopyField label="_payInLzToken" value="false" />
@@ -487,6 +637,82 @@ function PresetEditor({
           rows={2}
         />
       </Field>
+    </div>
+  );
+}
+
+function LiveQuoteCard({
+  loading,
+  error,
+  result,
+  quoteAt,
+  hasParams,
+  onUse,
+}: {
+  loading: boolean;
+  error: string | null;
+  result: QuoteResult | null;
+  quoteAt: number;
+  hasParams: boolean;
+  onUse: () => void;
+}) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const age = result && quoteAt ? Math.floor((now - quoteAt) / 1000) : null;
+
+  const nativeFeeWei = result?.nativeFee ?? 0n;
+  const nativeFeeEth = result ? formatUnits(nativeFeeWei, 18) : '';
+
+  let body: React.ReactNode;
+  if (!hasParams) {
+    body = <span className="text-ink-400">Fill recipient + amount to get a live quote.</span>;
+  } else if (loading) {
+    body = <span className="text-accent-yellow">quoting via RPC…</span>;
+  } else if (error) {
+    body = (
+      <span className="text-accent-red">
+        RPC quote failed: {error.slice(0, 140)}
+        {error.length > 140 ? '…' : ''}
+      </span>
+    );
+  } else if (result) {
+    body = (
+      <div className="flex items-baseline gap-3 flex-wrap">
+        <span>
+          <span className="text-ink-300">nativeFee:</span>{' '}
+          <span className="text-accent-green font-semibold">{nativeFeeEth}</span>{' '}
+          <span className="text-ink-400">ETH ({nativeFeeWei.toString()} wei)</span>
+        </span>
+        {result.lzTokenFee > 0n && (
+          <span className="text-ink-400">
+            lzTokenFee: {result.lzTokenFee.toString()}
+          </span>
+        )}
+        {age !== null && <span className="text-ink-500 text-[10px]">{age}s ago</span>}
+        <button
+          type="button"
+          onClick={onUse}
+          className="ml-auto px-2 py-0.5 text-xs rounded bg-accent-green/20 hover:bg-accent-green/30 border border-accent-green/40 text-accent-green"
+        >
+          Use this ↓
+        </button>
+      </div>
+    );
+  } else {
+    body = <span className="text-ink-400">waiting for params…</span>;
+  }
+
+  return (
+    <div className="border border-ink-700 rounded bg-ink-900 p-2 text-xs font-mono">
+      <div className="flex items-center gap-2 text-[10px] text-ink-400 mb-1">
+        <span className="inline-block w-2 h-2 rounded-full bg-accent-blue"></span>
+        Live RPC quote (auto-updates, 500ms debounce)
+      </div>
+      {body}
     </div>
   );
 }
