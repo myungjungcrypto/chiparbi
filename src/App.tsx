@@ -7,6 +7,7 @@ import { BridgePanel } from '@/components/BridgePanel';
 import { DepositNetworks } from '@/components/DepositNetworks';
 import { CountdownBar } from '@/components/CountdownBar';
 import { RiskBanner } from '@/components/RiskBanner';
+import { OftBridgeHelper } from '@/components/OftBridgeHelper';
 import { startBinance } from '@/sources/binanceWs';
 import { startUpbit } from '@/sources/upbitWs';
 import { startBithumb } from '@/sources/bithumbWs';
@@ -55,6 +56,7 @@ export default function App() {
         <PriceGrid />
         <SpreadMatrix />
         <BridgePanel />
+        <OftBridgeHelper />
         <DepositNetworks />
         <footer className="text-center text-[11px] text-ink-500 py-4 font-mono">
           chiparbi · built for $CHIP TGE monitoring · data: Binance, Upbit, Bithumb WS · GeckoTerminal, DEX Screener REST · Across REST
